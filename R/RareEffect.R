@@ -104,8 +104,8 @@ collapse_matrix <- function(objGeno, var_list, sampleID, modglmm, macThreshold =
     # mat <- mat[, idx, drop = FALSE]
     if (length(idx_rare) == 0 & length(idx_UR) == 0) {
         print("No variants with MAF < 0.01 or MAF > 0.99")
-        mat <- mat[, idx, drop = FALSE]
-        return(mat, NULL)
+        mat <- mat[, idx_rare, drop = FALSE]
+        return(list(mat, NULL))
     }
     mat_rare <- mat[, idx_rare, drop = FALSE]
     mat_UR <- mat[, idx_UR, drop = FALSE]
@@ -114,6 +114,7 @@ collapse_matrix <- function(objGeno, var_list, sampleID, modglmm, macThreshold =
     mat_UR_collapsed <- cbind(mat_rare, UR_rowsum)
     return(list(mat_UR_collapsed, flipped_var))
 }
+
 
 get_range <- function(v) {
     # input are vectors of variants by functional annotation
