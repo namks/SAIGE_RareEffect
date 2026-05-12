@@ -6,11 +6,13 @@
 #' @param vcfFile character. Path to vcf file
 #' @param vcfFileIndex character. Path to vcf index file. Indexed by tabix. Path to index for vcf file by tabix, .csi file using 'tabix --csi -p vcf file.vcf.gz'
 #' @param vcfField character. genotype field in vcf file to use. "DS" for dosages or "GT" for genotypes. By default, "DS".
+#' @param vcfFilters character. Comma-delimited list of FORMAT field filters for per-sample filtering. Genotypes failing any filter are treated as missing. Supports comparisons: >, <, >=, <=, ==. e.g. "DP>10,GQ>=30". By default, "" (no filtering).
 #' @param savFile character. Path to sav file
 #' @param savFileIndex character. Path to index for sav file .s1r
 #' @param bedFile character. Path to bed file (PLINK)
 #' @param bimFile character. Path to bim file (PLINK)
 #' @param famFile character. Path to fam file (PLINK)
+#' @param pgenPrefix character. Path to the pgen file minus its file extension (PLINK2).
 #' @param AlleleOrder character. alt-first or ref-first for bgen or PLINK files. By default, alt-first
 #' @param idstoIncludeFile character. Path to a file containing variant ids to be included from the dosage file. The file does not have a header and each line is for a marker ID. Variant ids are in the format chr:pos_ref/alt
 #' @param rangestoIncludeFile character. Path to a file containing genome regions to be included from the dosage file. The file contains three columns for chromosome, start, and end respectively with no header. Note for vcf and sav files, only the first line in the file will be used.
@@ -64,11 +66,13 @@ SPAGMMATtest = function(bgenFile = "",
                  vcfFile = "",
                  vcfFileIndex = "",
                  vcfField = "DS",
+                 vcfFilters = "", #new: comma-delimited list of filters, e.g. "DP>10,GQ<=30"
                  savFile = "",
                  savFileIndex = "",
                  bedFile="",
                  bimFile="",
                  famFile="",
+                 pgenPrefix = "",
                  AlleleOrder = "alt-first", #new
                  idstoIncludeFile = "",
                  rangestoIncludeFile = "",
@@ -117,9 +121,12 @@ SPAGMMATtest = function(bgenFile = "",
 		 is_fastTest = FALSE,
 		 pval_cutoff_for_fastTest = 0.05, 
 		 max_MAC_use_ER = 4, 
-		 subSampleFile = ""
+		 subSampleFile = "",
+		 is_noadjCov = FALSE
 ){
 
+  cat("is_noadjCov ", is_noadjCov, "\n")
+  cat("is_fastTest ", is_fastTest, "\n")
 
    #time_0 = proc.time()
 
@@ -332,7 +339,18 @@ SPAGMMATtest = function(bgenFile = "",
          is_fastTest = FALSE
 	 cat("No variance ratio file is specified, so is_fastTest is not working.\n")
       }
+      if(pval_cutoff_for_fastTest == 0){
+         is_fastTest = FALSE
+         cat("pval_cutoff_for_fastTest == 0, so is_fastTest is not working.\n")
+      }
+
     }
+
+    if(!isSparseGRM & !is_noadjCov){
+        is_fastTest = FALSE
+        cat("isSparseGRM is FALSE and is_noadjCov is FALSE,, so is_fastTest is not working.\n")
+    }
+
 
 
     if(is_fastTest){
@@ -343,10 +361,12 @@ SPAGMMATtest = function(bgenFile = "",
 	}else{
 	  cat("The fast tests will be performed (when p-values >= ", pval_cutoff_for_fastTest, ").\n")	
 	}
-      }else{
-          is_fastTest = FALSE
-	  cat("No sparse GRM is specified, so is_fastTest is not working.\n")
       }
+
+     #else{
+     #     is_fastTest = FALSE
+	#  cat("No sparse GRM is specified, so is_fastTest is not working.\n")
+      #}
     }
 
     nsample = length(obj.model$y)
@@ -361,12 +381,14 @@ SPAGMMATtest = function(bgenFile = "",
                  vcfFile = vcfFile,   #not activate yet
                  vcfFileIndex = vcfFileIndex,
                  vcfField = vcfField,
+                 vcfFilters = vcfFilters,
                  savFile = savFile,
                  savFileIndex = savFileIndex,
                  sampleFile = sampleFile,
                  bedFile=bedFile,
                  bimFile=bimFile,
                  famFile=famFile,
+                 pgenPrefix = pgenPrefix,
                  idstoIncludeFile = idstoIncludeFile,
                  rangestoIncludeFile = rangestoIncludeFile,
                  chrom = chrom,
@@ -403,6 +425,7 @@ SPAGMMATtest = function(bgenFile = "",
 		     t_mu=obj.model$mu,
 		     t_varRatio_sparse = as.vector(ratioVecList$ratioVec_sparse),
 		     t_varRatio_null = as.vector(ratioVecList$ratioVec_null),
+		     t_varRatio_null_noXadj = as.vector(ratioVecList$ratioVec_null_noXadj),
 		     t_cateVarRatioMinMACVecExclude = cateVarRatioMinMACVecExclude,
 		     t_cateVarRatioMaxMACVecInclude = cateVarRatioMaxMACVecInclude,
 		     t_SPA_Cutoff = SPAcutoff,
@@ -412,6 +435,7 @@ SPAGMMATtest = function(bgenFile = "",
 		     t_impute_method = impute_method, 
 		     t_flagSparseGRM = isSparseGRM,
 		     t_isFastTest = is_fastTest,
+		     t_isnoadjCov = is_noadjCov,
 		     t_pval_cutoff_for_fastTest = pval_cutoff_for_fastTest,
         	     t_locationMat = as.matrix(sparseSigmaRList$locations),
         	     t_valueVec = sparseSigmaRList$values,
@@ -529,7 +553,8 @@ SPAGMMATtest = function(bgenFile = "",
 			print("Firth correction will be used for effect sizes of single variant tests")
 
 		}
-	}	
+	}
+	
 	SAIGE.Region(mu,
 		     OutputFile,
 		     MACCutoff_to_CollapseUltraRare,

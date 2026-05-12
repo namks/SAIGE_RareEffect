@@ -3,6 +3,7 @@ checkGenoInput_LDmat = function(bgenFile = "",
                  vcfFile = "",
                  vcfFileIndex = "",
                  vcfField = "DS",
+                 vcfFilters = "",
                  savFile = "",
                  savFileIndex = "",
                  sampleFile = "",
@@ -65,6 +66,7 @@ setGenoInput_LDmat = function(bgenFile = "",
                  vcfFile = "",
                  vcfFileIndex = "",
                  vcfField = "DS",
+                 vcfFilters = "",
                  savFile = "",
                  savFileIndex = "",
                  sampleFile = "",
@@ -83,6 +85,7 @@ setGenoInput_LDmat = function(bgenFile = "",
                  vcfFile = vcfFile,
                  vcfFileIndex = vcfFileIndex,
                  vcfField = vcfField,
+                 vcfFilters = vcfFilters,
                  savFile = savFile,
                  savFileIndex = savFileIndex,
                  bedFile = bedFile,
@@ -159,6 +162,7 @@ setGenoInput_LDmat = function(bgenFile = "",
         first_sample_line = readLines(sf, n = 1)
         close(sf)
         first_sample_line_list = strsplit(first_sample_line, split="[\ \t]+")[[1]]
+        cat("First sample line:", first_sample_line)
 
         if(first_sample_line == "ID_1 ID_2 missing sex" | first_sample_line == "ID_1 ID_1 0 0" | length(first_sample_line_list) == 4){
             cat("sample file is in the bgenix format\n")
@@ -341,7 +345,7 @@ if(FALSE){
       sampleInModel = as.character(NULL)
     }
 
-    setVCFobjInCPP(vcfFile, vcfFileIndex, vcfField, t_SampleInModel = sampleInModel)
+    setVCFobjInCPP(vcfFile, vcfFileIndex, vcfField, vcfFilters, t_SampleInModel = sampleInModel)
     if(!is.null(IDsToInclude)){
       SNPlist = paste(c("set1", IDsToInclude), collapse = "\t")
       in_chrom="fake_chrom"
