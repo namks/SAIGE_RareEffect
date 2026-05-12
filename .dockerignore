@@ -1,0 +1,23 @@
+.git
+.gitignore
+.github
+.Rbuildignore
+
+# Host-side build artifacts; rebuilt inside the container
+.pixi
+plink-ng
+plink-ng-*
+libplink2_includes.*
+src/*.o
+src/*.so
+src/SAIGE/libs
+
+# Local test scratch
+extdata/output_re_test
+extdata/output/*.log
+
+# Editor/OS noise
+.DS_Store
+.vscode
+.idea
+*.swp

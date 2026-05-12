@@ -1,6 +1,11 @@
 FROM ubuntu:20.04
 
 LABEL maintainer="wzhou@broadinstitute.org"
+LABEL org.opencontainers.image.title="SAIGE-RareEffect"
+LABEL org.opencontainers.image.description="SAIGE 1.5.1 with RareEffect for rare-variant effect-size estimation and PRS"
+LABEL org.opencontainers.image.version="1.5.1"
+LABEL org.opencontainers.image.source="https://github.com/namks/SAIGE_RareEffect"
+LABEL org.opencontainers.image.licenses="GPL-2.0-or-later"
 
 ENV LC_ALL C.UTF-8
 ENV LANG C.UTF-8
@@ -31,7 +36,14 @@ RUN pixi run R CMD INSTALL .
 
 RUN mv extdata/step1_fitNULLGLMM.R extdata/step2_SPAtests.R extdata/step3_LDmat.R extdata/createSparseGRM.R /usr/local/bin/ && \
    chmod a+x /usr/local/bin/step1_fitNULLGLMM.R /usr/local/bin/step2_SPAtests.R /usr/local/bin/step3_LDmat.R /usr/local/bin/createSparseGRM.R && \
+   for f in run_RareEffect.R calculate_RareEffect_PRS.R; do \
+     mv extdata/$f /usr/local/bin/$f && \
+     sed -i '1i #!/usr/bin/env -S pixi run --manifest-path /app/pixi.toml Rscript' /usr/local/bin/$f && \
+     chmod a+x /usr/local/bin/$f; \
+   done && \
    createSparseGRM.R --help && \
    step1_fitNULLGLMM.R --help && \
    step2_SPAtests.R --help && \
-   step3_LDmat.R --help
+   step3_LDmat.R --help && \
+   run_RareEffect.R --help && \
+   calculate_RareEffect_PRS.R --help
