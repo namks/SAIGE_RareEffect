@@ -1,53 +1,57 @@
 # Read Group file and split variants by functional annotations
 read_groupfile <- function(groupfile_name, gene_name) {
-    groupfile <- file(groupfile_name, "r")
-    line <- 0
+    lines <- readLines(groupfile_name)
+
+    # Pre-filter to only the gene's lines via fixed-string startsWith
+    # (regex strsplit on every line is the dominant cost for large group files)
+    prefix_sp <- paste0(gene_name, " ")
+    prefix_tab <- paste0(gene_name, "\t")
+    gene_lines <- lines[startsWith(lines, prefix_sp) | startsWith(lines, prefix_tab)]
+
     var <- NULL
     anno <- NULL
-
-    while (TRUE) {
-        line <- line + 1
-        marker_group_line <- readLines(groupfile, n = 1)
-
-        if (length(marker_group_line) == 0) {
-            break
+    for (marker_group_line in gene_lines) {
+        marker_group_line_list <- strsplit(marker_group_line, split = "[ \t]+")[[1]]
+        if (length(marker_group_line_list) < 2) next
+        if (marker_group_line_list[2] == "var") {
+            var <- marker_group_line_list
+        } else {
+            anno <- marker_group_line_list
         }
-
-        marker_group_line_list <- strsplit(marker_group_line, split = c(" +", "\t"))[[1]]
-
-        if (marker_group_line_list[1] == gene_name) {
-            if (marker_group_line_list[2] == "var") {
-                var <- marker_group_line_list
-            } else {
-                anno <- marker_group_line_list
-            }
-        }
+        if (!is.null(var) && !is.null(anno)) break
     }
 
-    lof_idx <- which(anno == "lof")
-    mis_idx <- which(anno == "missense")
-    syn_idx <- which(anno == "synonymous")
-
-    lof_var <- var[lof_idx]
-    mis_var <- var[mis_idx]
-    syn_var <- var[syn_idx]
-
-    out <- list(lof_var, mis_var, syn_var)
-    close(groupfile)
-    return(out)
+    lof_var <- var[which(anno == "lof")]
+    mis_var <- var[which(anno == "missense")]
+    syn_var <- var[which(anno == "synonymous")]
+    list(lof_var, mis_var, syn_var)
 }
 
 read_matrix_by_one_marker <- function(objGeno, var_list, sampleID) {
     n_samples <- length(sampleID)
-    mat <- Matrix::Matrix(0, nrow = n_samples, ncol = 0, sparse = TRUE)
     if (length(var_list) == 0) {
-        print("No variants in the list")
-        return(mat)
+        mat <- Matrix::Matrix(0, nrow = n_samples, ncol = 0, sparse = TRUE)
+        message("No variants in the list")
+        return(list(mat, rep(FALSE, 0)))
     }
-    is_flipped <- rep(FALSE, length(var_list))
-    for (i in 1:length(var_list)) {
+    p <- length(var_list)
+    is_flipped <- rep(FALSE, p)
+    i_list <- vector("list", p)
+    x_list <- vector("list", p)
+    nz_counts <- integer(p)
+
+    # Precompute marker index in objGeno$markerInfo$ID once
+    idx_map <- match(var_list, objGeno$markerInfo$ID)
+    if (anyNA(idx_map)) {
+        missing_vars <- var_list[is.na(idx_map)]
+        stop(sprintf("Variants not found in objGeno$markerInfo$ID: %s%s",
+                     paste(head(missing_vars, 5), collapse = ", "),
+                     if (length(missing_vars) > 5) sprintf(" (+%d more)", length(missing_vars) - 5) else ""))
+    }
+
+    for (i in seq_along(var_list)) {
         t_GVec <- rep(0, n_samples)
-        idx <- which(var_list[i] == objGeno$markerInfo$ID)
+        idx <- idx_map[i]
         SAIGE::Unified_getOneMarker(t_genoType = objGeno$genoType,
             t_gIndex_prev = objGeno$markerInfo$genoIndex_prev[idx],
             t_gIndex = objGeno$markerInfo$genoIndex[idx],
@@ -68,20 +72,33 @@ read_matrix_by_one_marker <- function(objGeno, var_list, sampleID) {
             t_isImputation = FALSE
         )
 
-	    t_GVec[t_GVec < 0] <- 0     # Convert missing to zero
-        # If MAF > 0.5, flip allele
-        if (sum(t_GVec) > n_samples) {
+        # Single scan: positive entries are the non-missing, non-zero genotypes
+        # (missing is encoded as -1 by C++ side and is skipped naturally)
+        nz <- which(t_GVec > 0)
+        vals <- t_GVec[nz]
+        s <- sum(vals)
+        if (s > n_samples) {
+            # Major allele is ALT — flip. Almost never hit for rare variants.
+            # Note: this densifies the column (most zeros become 2s).
+            t_GVec[t_GVec < 0] <- 0
             t_GVec <- 2 - t_GVec
             is_flipped[i] <- TRUE
+            nz <- which(t_GVec > 0)
+            vals <- t_GVec[nz]
         }
-        t_GVec_sp <- as(t_GVec, "sparseVector")
-        t_GVec_sp_mat <- as(t_GVec_sp, "Matrix")
-
-        mat <- cbind(mat, t_GVec_sp_mat)
+        i_list[[i]] <- nz
+        x_list[[i]] <- vals
+        nz_counts[i] <- length(nz)
     }
 
-    colnames(mat) <- var_list
-    rownames(mat) <- sampleID
+    # Construct sparseMatrix from accumulated triplets in one call
+    mat <- Matrix::sparseMatrix(
+        i = unlist(i_list, use.names = FALSE),
+        j = rep.int(seq_len(p), nz_counts),
+        x = unlist(x_list, use.names = FALSE),
+        dims = c(n_samples, p),
+        dimnames = list(sampleID, var_list)
+    )
 
     return(list(mat, is_flipped))
 }
@@ -90,7 +107,7 @@ collapse_matrix <- function(objGeno, var_list, sampleID, modglmm, macThreshold =
     n_samples <- length(sampleID)
     mat <- Matrix::Matrix(0, nrow = n_samples, ncol = 0, sparse = TRUE)
     if (length(var_list) == 0) {
-        print("No variants in the list")
+        message("No variants in the list")
         return(list(mat, NULL))
     }
     tmp <- read_matrix_by_one_marker(objGeno, var_list, sampleID)
@@ -98,14 +115,14 @@ collapse_matrix <- function(objGeno, var_list, sampleID, modglmm, macThreshold =
     is_flipped <- tmp[[2]]
     flipped_var <- as.data.table(cbind(var_list, is_flipped))
     mat <- mat[which(rownames(mat) %in% modglmm$sampleID), , drop = FALSE]
-    MAF <- colSums(mat) / (2 * nrow(mat))
-    idx_rare <- which((MAF < 0.01) & (colSums(mat) >= macThreshold))
-    idx_UR <- which((MAF > 0) & (colSums(mat) < macThreshold))
-    # mat <- mat[, idx, drop = FALSE]
+    MAC <- colSums(mat)
+    MAF <- MAC / (2 * nrow(mat))
+    idx_rare <- which((MAF < 0.01) & (MAC >= macThreshold))
+    idx_UR <- which((MAF > 0) & (MAC < macThreshold))
     if (length(idx_rare) == 0 & length(idx_UR) == 0) {
-        print("No variants with MAF < 0.01 or MAF > 0.99")
-        mat <- mat[, idx_rare, drop = FALSE]
-        return(list(mat, NULL))
+        message("No variants with MAF < 0.01 or MAC > 0")
+        empty_mat <- Matrix::Matrix(0, nrow = nrow(mat), ncol = 0, sparse = TRUE)
+        return(list(empty_mat, flipped_var))
     }
     mat_rare <- mat[, idx_rare, drop = FALSE]
     mat_UR <- mat[, idx_UR, drop = FALSE]
@@ -114,7 +131,6 @@ collapse_matrix <- function(objGeno, var_list, sampleID, modglmm, macThreshold =
     mat_UR_collapsed <- cbind(mat_rare, UR_rowsum)
     return(list(mat_UR_collapsed, flipped_var))
 }
-
 
 get_range <- function(v) {
     # input are vectors of variants by functional annotation
@@ -125,8 +141,6 @@ get_range <- function(v) {
             pos <- as.numeric(str_split_fixed(v[[i]], ":", 4)[,2]) # Modified in 0.3
             sub_start_pos <- min(pos)
             sub_end_pos <- max(pos)
-            print(sub_start_pos)
-            print(sub_end_pos)
             if (start_pos > sub_start_pos) {
                 start_pos <- sub_start_pos
             }
@@ -164,49 +178,54 @@ calc_log_lik <- function(delta, S, UtY, Y_UUtY) {
     return(as.numeric(out))
 }
 
-calc_post_beta <- function(K, G, delta, S, UtY, U) {
-    K_sparse <- as(K, "dgCMatrix")
-    if (length(S) == 1) {
-        S <- as.matrix(S)
+calc_post_beta <- function(G, delta, S, UtY, U, Sigma = NULL) {
+    d_vec <- as.numeric(1 / (S + delta))
+    if (length(d_vec) == 1) {
+        D <- matrix(d_vec, 1, 1)
+    } else {
+        D <- diag(d_vec)
     }
-
-    out <- K_sparse %*% t(G) %*% U %*% diag(1 / (S + delta)) %*% (UtY)
+    UDUtY <- U %*% D %*% UtY
+    if (is.null(Sigma)) {
+        out <- t(G) %*% UDUtY
+    } else {
+        K_sparse <- as(Sigma, "dgCMatrix")
+        out <- K_sparse %*% t(G) %*% UDUtY
+    }
     return(out)
 }
 
 # Run FaST-LMM to obtain posterior beta
-fast_lmm <- function(G, Y) {
-    # if sum(G) == 0, let effect size = 0
-    print("Estimating beta using FaST-LMM")
+fast_lmm <- function(G, Y, Sigma = NULL) {
     G[is.na(G)] <- 0
-    GtG <- t(G) %*% G
-    if (sum(G, na.rm = T) == 0) {
-        return (list(as.matrix(0), 0, 1e6, GtG))
+    GtG <- crossprod(G)
+    if (sum(G, na.rm = TRUE) == 0) {
+        return(list(as.matrix(0), 0, 1e6, GtG))
     }
     Y <- as.matrix(Y)
-    K <- diag(1, nrow = ncol(G))
-    L <- chol(K)
-    W <- G %*% L
-    W_sparse <- as(W, "dgCMatrix")
-    svd_mat <- sparsesvd::sparsesvd(W_sparse)
 
+    # W = G %*% chol(Sigma), or just G when Sigma = I
+    if (is.null(Sigma)) {
+        W_sparse <- as(G, "dgCMatrix")
+    } else {
+        L <- chol(Sigma)
+        W_sparse <- as(G %*% L, "dgCMatrix")
+    }
+
+    svd_mat <- sparsesvd::sparsesvd(W_sparse)
     U <- svd_mat$u
     S <- (svd_mat$d)^2
-
     UtY <- t(U) %*% Y
-
-    # Y_UUtY = Y - UUtY
     Y_UUtY <- Y - U %*% UtY
 
     opt <- optim(par = 1, fn = calc_log_lik, S = S, UtY = UtY, Y_UUtY = Y_UUtY,
-                 method = c("Brent"), lower = 0, upper = 1e6, control = list(fnscale = -1))
-    opt_delta <- opt$par
+                 method = "Brent", lower = 1e-10, upper = 1e6,
+                 control = list(fnscale = -1))
 
-    tr_GtG <- sum(diag(GtG %*% K))
+    tr_GtG_Sigma <- if (is.null(Sigma)) sum(diag(GtG)) else sum(diag(GtG %*% Sigma))
+    post_beta <- calc_post_beta(G, opt$par, S, UtY, U, Sigma = Sigma)
 
-    post_beta <- calc_post_beta(K, G, opt_delta, S, UtY, U)
-
-    return (list(post_beta, tr_GtG, opt_delta, GtG))
+    return(list(post_beta, tr_GtG_Sigma, opt$par, GtG))
 }
 
 
@@ -220,68 +239,61 @@ calc_gene_effect_size <- function(G, lof_ncol, post_beta, Y) {
     return(m1$coefficients[2])
 }
 
-mom_estimator_marginal <- function(G, y) {
+mom_estimator_marginal <- function(G, y, Sigma = NULL) {
     n <- length(y)
     G <- as(G, "dgCMatrix")
     G[is.na(G)] <- 0
-    # tr(G Sigma G^T G Sigma G^T) = sum((G Sigma G^T )^2) = sum(G^T G Sigma)^2
-    Sigma <- diag(1, nrow = ncol(G))
 
-    system.time({
-        t1 <- sum((crossprod(G) %*% Sigma)^2)
-    })
-    t2 <- sum(diag(crossprod(G) %*% Sigma))
-    A <- matrix(c(t1, t2, t2, n), ncol = 2)
-    c1 <- as.numeric(t(y) %*% G %*% Sigma %*% t(G) %*% y)
+    if (is.null(Sigma)) {
+        GtG <- crossprod(G)
+        t1 <- sum(GtG^2)                    # tr((GG')^2)
+        t2 <- sum(G^2)                      # tr(G'G)
+        Gty <- crossprod(G, y)
+        c1 <- as.numeric(sum(Gty^2))        # y'GG'y
+    } else {
+        GtG_Sigma <- crossprod(G) %*% Sigma
+        t1 <- sum(GtG_Sigma^2)
+        t2 <- sum(diag(GtG_Sigma))
+        c1 <- as.numeric(t(y) %*% G %*% Sigma %*% t(G) %*% y)
+    }
+
     c2 <- sum(y^2)
+    A <- matrix(c(t1, t2, t2, n), ncol = 2)
     b <- matrix(c(c1, c2), ncol = 1)
-    var_comp <- solve(A) %*% b
-    # print(var_comp)
-    # h2_mom_marginal <- var_comp[1, 1] / sum(var_comp)
-    return (var_comp)
+    return(solve(A, b))
 }
 
-mom_estimator_joint <- function(G1, G2, G3, y) {
+mom_estimator_joint <- function(G1, G2, G3, y,
+                                 Sigma1 = NULL, Sigma2 = NULL, Sigma3 = NULL) {
     n <- length(y)
+    G1 <- as(G1, "dgCMatrix"); G1[is.na(G1)] <- 0
+    G2 <- as(G2, "dgCMatrix"); G2[is.na(G2)] <- 0
+    G3 <- as(G3, "dgCMatrix"); G3[is.na(G3)] <- 0
 
-    G1 <- as(G1, "dgCMatrix")
-    G1[is.na(G1)] <- 0
-    G2 <- as(G2, "dgCMatrix")
-    G2[is.na(G2)] <- 0
-    G3 <- as(G3, "dgCMatrix")
-    G3[is.na(G3)] <- 0
-    Sigma1 <- diag(1, nrow = ncol(G1)) # L1 %*% t(L1)
-    Sigma2 <- diag(1, nrow = ncol(G2)) # L2 %*% t(L2)
-    Sigma3 <- diag(1, nrow = ncol(G3)) # L3 %*% t(L3)
+    # W_k = G_k %*% chol(Sigma_k), or G_k when Sigma_k = I
+    W1 <- if (is.null(Sigma1)) G1 else G1 %*% chol(Sigma1)
+    W2 <- if (is.null(Sigma2)) G2 else G2 %*% chol(Sigma2)
+    W3 <- if (is.null(Sigma3)) G3 else G3 %*% chol(Sigma3)
 
-    L1 <- chol(Sigma1)
-    L2 <- chol(Sigma2)
-    L3 <- chol(Sigma3)
+    t11 <- sum(crossprod(W1)^2)
+    t22 <- sum(crossprod(W2)^2)
+    t33 <- sum(crossprod(W3)^2)
+    t12 <- sum(crossprod(W1, W2)^2)
+    t13 <- sum(crossprod(W1, W3)^2)
+    t23 <- sum(crossprod(W2, W3)^2)
+    t14 <- sum(W1^2)
+    t24 <- sum(W2^2)
+    t34 <- sum(W3^2)
 
-    t11 <- sum((crossprod(G1) %*% Sigma1)^2)
-    t22 <- sum((crossprod(G2) %*% Sigma2)^2)
-    t33 <- sum((crossprod(G3) %*% Sigma3)^2)
+    A <- matrix(c(t11,t12,t13,t14, t12,t22,t23,t24,
+                  t13,t23,t33,t34, t14,t24,t34,n), ncol = 4)
 
-    t12 <- sum((t(G1 %*% L1) %*% (G2 %*% L2))^2)
-    t13 <- sum((t(G1 %*% L1) %*% (G3 %*% L3))^2)
-    t23 <- sum((t(G2 %*% L2) %*% (G3 %*% L3))^2)
+    c1 <- as.numeric(sum(crossprod(W1, y)^2))
+    c2 <- as.numeric(sum(crossprod(W2, y)^2))
+    c3 <- as.numeric(sum(crossprod(W3, y)^2))
+    b <- matrix(c(c1, c2, c3, sum(y^2)), ncol = 1)
 
-    t14 <- sum(diag(t(G1) %*% G1 %*% Sigma1))
-    t24 <- sum(diag(t(G2) %*% G2 %*% Sigma2))
-    t34 <- sum(diag(t(G3) %*% G3 %*% Sigma3))
-
-    A <- matrix(c(t11, t12, t13, t14, t12, t22, t23, t24, t13, t23, t33, t34, t14, t24, t34, n), ncol = 4)
-
-    c1 <- as.numeric(t(y) %*% G1 %*% Sigma1 %*% t(G1) %*% y)
-    c2 <- as.numeric(t(y) %*% G2 %*% Sigma2 %*% t(G2) %*% y)
-    c3 <- as.numeric(t(y) %*% G3 %*% Sigma3 %*% t(G3) %*% y)
-    c4 <- sum(y^2)
-    b <- matrix(c(c1, c2, c3, c4), ncol = 1)
-
-    var_comp <- solve(A) %*% b
-    # print(var_comp)
-    #  h2_mom_joint <- c(var_comp[1, 1], var_comp[2, 1], var_comp[3, 1]) / sum(var_comp)
-    return (var_comp)
+    return(solve(A, b))
 }
 
 # calculate_single_blup <- function(G, delta, Sigma, y) {
@@ -291,33 +303,35 @@ mom_estimator_joint <- function(G1, G2, G3, y) {
 #     return (beta)
 # }
 
-calculate_joint_blup <- function(G1, G2, G3, tau1, tau2, tau3, Sigma1, Sigma2, Sigma3, psi, y) {
+calculate_joint_blup <- function(G1, G2, G3, tau1, tau2, tau3, psi, y) {
     G1 <- as(G1, "dgCMatrix")
     G2 <- as(G2, "dgCMatrix")
     G3 <- as(G3, "dgCMatrix")
     G <- cbind(G1, G2, G3)
     G[is.na(G)] <- 0
+    p1 <- ncol(G1); p2 <- ncol(G2); p3 <- ncol(G3)
 
-    Sigma <- bdiag(tau1 * Sigma1, tau2 * Sigma2, tau3 * Sigma3)
-    beta <- solve(t(G) %*% G / psi + solve(Sigma)) %*% t(G) %*% y / psi
-    return (beta)
+    GtG <- crossprod(G)
+    Gty <- crossprod(G, y)
+
+    # (G'G / psi + Sigma^{-1}) where Sigma = bdiag(tau1*I, tau2*I, tau3*I)
+    C <- GtG / psi
+    inv_tau_diag <- c(rep(1/tau1, p1), rep(1/tau2, p2), rep(1/tau3, p3))
+    diag(C) <- diag(C) + inv_tau_diag
+
+    beta <- solve(C, Gty / psi)
+    return(beta)
 }
 
-weight_cal <- function(beta_k, delta = 10^(-5), gamma = 2, q = 0, factor2 = 1, n_lof, n_mis, n_syn){
-	# delta=10^(-5); gamma=2; q=0
+weight_cal <- function(beta_k, delta = 10^(-5), gamma = 2, q = 0, factor2 = 1) {
 	p <- length(beta_k)
-    p1 <- n_lof
-    p2 <- n_mis
-    p3 <- n_syn
-	w_out = rep(0, p)
-	idx_null = NULL
-	idx<-which(abs(beta_k) <= delta)
+	w_out <- rep(0, p)
+	idx <- which(abs(beta_k) <= delta)
 	if(length(idx)> 0){
 		beta_k1<-beta_k[idx]
 		b_delta = abs(beta_k1/delta)^{gamma}
 		logw1 = (q-2) * log(delta) + (q-2)/gamma* log(1+ b_delta)
 		w_out[idx]<-exp(logw1 * factor2)
-		idx_null = idx
 	}
 	idx<-which(abs(beta_k) > delta)
 	if(length(idx)> 0){
@@ -335,46 +349,60 @@ weight_cal <- function(beta_k, delta = 10^(-5), gamma = 2, q = 0, factor2 = 1, n
 	return(list(w_out=w_out))
 }
 
-adaptive_ridge <- function(X, y, lambda, q = 0, delta = 1e-5, gamma = 2, max_iter = 100, tol = 0.01, sigma_sq = 1, n_lof, n_mis, n_syn) {
-    w <- rep(1, ncol(X))     # Initialize weights
-    beta <- rep(0, ncol(X))  # Initialize beta
-    beta_all<-NULL
-    w_all<-NULL
-    idx_set<-1:length(w)
+adaptive_ridge <- function(X, y, lambda, q = 0, delta = 1e-5, gamma = 2, max_iter = 100, tol = 0.01, sigma_sq = 1) {
+    w <- rep(1, ncol(X))
+    beta <- rep(0, ncol(X))
 
-    # save to reduce redundant computation
-    Xy = t(X) %*% y
-    XX = t(X) %*% X
+    Xy <- crossprod(X, y)
+    XX <- crossprod(X)
     for (k in 1:max_iter) {
-        W <- diag(w)
-        # using solve is better than calculating inverse matrix first...
-        beta_new <- solve(XX + lambda * W, Xy)  # Ridge regression for initial estimate
+        A <- XX + 0                                 # copy to preserve XX
+        diag(A) <- diag(A) + lambda * w
+        beta_new <- solve(A, Xy)
 
-        # Update weights
-        w_new_re <- weight_cal(beta_new, delta=delta, gamma=gamma, q=q, n_lof=n_lof, n_mis=n_mis, n_syn=n_syn)
-        w_new = w_new_re$w_out
+        w_new <- weight_cal(beta_new, delta = delta, gamma = gamma, q = q)$w_out
 
-        # print(sqrt(sum((beta_new - beta)^2)))
-        if (sqrt(sum((beta_new - beta)^2)) < sum(beta^2)*tol) {
-            # print(paste0("Converged at iteration: ", k))
+        if (sqrt(sum((beta_new - beta)^2)) < sum(beta^2) * tol) {
             break
         }
 
         beta <- beta_new
         w <- w_new
-        w_all<-cbind(w_all, w)
-        beta_all<-cbind(beta_all, beta)
     }
 
-    A <- XX
+    A <- XX + 0
     diag(A) <- diag(A) + lambda * w
-    L <- chol(A)
-    A_inv <- chol2inv(L)
+    A_inv <- chol2inv(chol(A))
 
     cov_beta <- as.numeric(sigma_sq) * (A_inv %*% XX %*% A_inv)
     se_beta <- sqrt(diag(cov_beta))
 
-    list(beta = beta, weights = w, iterations = k, beta_all=beta_all, w_all=w_all, se_beta = se_beta)
+    list(beta = beta, weights = w, iterations = k, se_beta = se_beta)
+}
+
+# Helper: run FaST-LMM + MoM for a single annotation group
+estimate_group <- function(mat, y_vec, sigma_sq) {
+    result <- fast_lmm(G = mat, Y = y_vec)
+    post_beta <- result[[1]]
+    tr_GtG    <- result[[2]]
+    delta     <- result[[3]]
+    GtG       <- result[[4]]
+    tau       <- as.numeric(sigma_sq / delta)
+    tau_mom   <- mom_estimator_marginal(G = mat, y = y_vec)
+    list(post_beta = post_beta, tr_GtG = tr_GtG, delta = delta,
+         GtG = GtG, tau = tau, tau_mom = tau_mom)
+}
+
+# Helper: compute gene-level heritability for one group
+compute_h2 <- function(tau_adj, tr_GtG, sigma_sq, denom_extra) {
+    max(tau_adj * tr_GtG / (tau_adj * tr_GtG + sigma_sq * denom_extra), 0)
+}
+
+# Helper: compute PEV for one group
+compute_pev <- function(GtG, sigma_sq, tau_adj) {
+    GtG_scaled <- GtG / as.numeric(sigma_sq)
+    diag(GtG_scaled) <- diag(GtG_scaled) + 1 / tau_adj
+    diag(solve(GtG_scaled))
 }
 
 run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFile, bimFile, famFile, macThreshold, collapseLoF, collapsemis, collapsesyn, apply_AR, outputPrefix) {
@@ -387,12 +415,11 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         modglmm$residuals <- sqrt(v) * (1 / (modglmm$fitted.values * (1 - modglmm$fitted.values)) * (modglmm$y - modglmm$fitted.values))
     }
     sigma_sq <- var(modglmm$residuals)
-    # n_samples <- length(modglmm$residuals)
 
     # Set PLINK object
-    bim <- fread(bimFile)
-    fam <- fread(famFile)
-    sampleID <- as.character(fam$V2)
+    # Only column 2 of fam (IID) is needed; bim is not used at R level
+    fam <- fread(famFile, select = 2, header = FALSE)
+    sampleID <- as.character(fam[[1]])
     n_samples <- length(sampleID)
 
     objGeno <- SAIGE::setGenoInput(bgenFile = "",
@@ -413,21 +440,21 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
             sampleInModel = sampleID
         )
 
-    print("Analysis started")
+    message("Analysis started")
 
     var_by_func_anno <- read_groupfile(groupFile, geneName)
 
     # LoF
     if (length(var_by_func_anno[[1]]) == 0) {
-        print("LoF variant does not exist.")
+        message("LoF variant does not exist.")
     }
     # missense
     if (length(var_by_func_anno[[2]]) == 0) {
-        print("missense variant does not exist.")
+        message("missense variant does not exist.")
     }
     # synonymous
     if (length(var_by_func_anno[[3]]) == 0) {
-        print("synonymous variant does not exist.")
+        message("synonymous variant does not exist.")
     }
 
     # Remove variants not in plink file
@@ -447,13 +474,27 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         lof_mat_collapsed <- lof_mat_collapsed_all[[1]]
         lof_flipped <- lof_mat_collapsed_all[[2]]
     }
-    mis_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[2]], sampleID, modglmm, macThreshold)
-    mis_mat_collapsed <- mis_mat_collapsed_all[[1]]
-    mis_flipped <- mis_mat_collapsed_all[[2]]
+    if (collapsemis) {
+        mis_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[2]], sampleID, modglmm, macThreshold = 0)
+        mis_mat_collapsed <- mis_mat_collapsed_all[[1]]
+        mis_flipped <- mis_mat_collapsed_all[[2]]
+        mis_mat_collapsed <- Matrix::Matrix(rowSums(mis_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(mis_mat_collapsed), NULL))
+    } else {
+        mis_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[2]], sampleID, modglmm, macThreshold)
+        mis_mat_collapsed <- mis_mat_collapsed_all[[1]]
+        mis_flipped <- mis_mat_collapsed_all[[2]]
+    }
 
-    syn_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[3]], sampleID, modglmm, macThreshold)
-    syn_mat_collapsed <- syn_mat_collapsed_all[[1]]
-    syn_flipped <- syn_mat_collapsed_all[[2]]
+    if (collapsesyn) {
+        syn_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[3]], sampleID, modglmm, macThreshold = 0)
+        syn_mat_collapsed <- syn_mat_collapsed_all[[1]]
+        syn_flipped <- syn_mat_collapsed_all[[2]]
+        syn_mat_collapsed <- Matrix::Matrix(rowSums(syn_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(syn_mat_collapsed), NULL))
+    } else {
+        syn_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[3]], sampleID, modglmm, macThreshold)
+        syn_mat_collapsed <- syn_mat_collapsed_all[[1]]
+        syn_flipped <- syn_mat_collapsed_all[[2]]
+    }
 
     # Set column name
     if (ncol(lof_mat_collapsed) > 0) {
@@ -480,21 +521,17 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
     # print("Dimension of G")
     # print(dim(G))
 
-    # Obtain residual vector and genotype matrix with the same order
-    y_tilde <- cbind(modglmm$sampleID, modglmm$residuals)
-    y_tilde <- y_tilde[which(y_tilde[,1] %in% sampleID),]
-    # G <- as.matrix(G)
-    G_reordered <- G[match(y_tilde[,1], rownames(G)),]
+    # Obtain residual vector and genotype matrix with the same sample order
+    # Use index-based alignment instead of cbind (which coerces numeric to character)
+    common_samples <- intersect(modglmm$sampleID, rownames(G))
+    model_idx <- match(common_samples, modglmm$sampleID)
+    y_vec <- as.numeric(modglmm$residuals[model_idx])
+    G_reordered <- G[match(common_samples, rownames(G)), , drop = FALSE]
     if (traitType == "binary") {
-        vG_reordered <- as.vector(sqrt(v)) * G_reordered    # Sigma_e^(-1/2) G
+        v_ordered <- v[model_idx]
+        vG_reordered <- as.vector(sqrt(v_ordered)) * G_reordered    # Sigma_e^(-1/2) G
     }
     n_samples <- nrow(G_reordered)
-    # print("Dimension of G_reordered")
-    # print(dim(G_reordered))
-
-    post_beta_lof <- NULL
-    post_beta_mis <- NULL
-    post_beta_syn <- NULL
 
     # Define matrices by functional annotation
     if (lof_ncol == 0) {
@@ -527,42 +564,14 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         }
     }
 
-    # Run FaST-LMM for each functional annotation (estimate marginal variance component tau)
-    if (lof_ncol > 0) {
-        fast_lmm_lof <- fast_lmm(G = lof_mat, Y = as.numeric(y_tilde[,2]))
-        post_beta_lof <- fast_lmm_lof[[1]]
-        tr_GtG_lof <- fast_lmm_lof[[2]]
-        delta_lof <- fast_lmm_lof[[3]]
-        GtG_lof <- fast_lmm_lof[[4]]
-        tau_lof <- as.numeric(sigma_sq / delta_lof)
-        tau_lof_mom_marginal <- mom_estimator_marginal(G = lof_mat, y = as.numeric(y_tilde[,2]))
-    } else {
-        tau_lof <- 0
-    }
+    # Run FaST-LMM + MoM for each functional annotation group
+    est_lof <- if (lof_ncol > 0) estimate_group(lof_mat, y_vec, sigma_sq) else NULL
+    est_mis <- if (mis_ncol > 0) estimate_group(mis_mat, y_vec, sigma_sq) else NULL
+    est_syn <- if (syn_ncol > 0) estimate_group(syn_mat, y_vec, sigma_sq) else NULL
 
-    if (mis_ncol > 0) {
-        fast_lmm_mis <- fast_lmm(G = mis_mat, Y = as.numeric(y_tilde[,2]))
-        post_beta_mis <- fast_lmm_mis[[1]]
-        tr_GtG_mis <- fast_lmm_mis[[2]]
-        delta_mis <- fast_lmm_mis[[3]]
-        GtG_mis <- fast_lmm_mis[[4]]
-        tau_mis <- as.numeric(sigma_sq / delta_mis)
-        tau_mis_mom_marginal <- mom_estimator_marginal(G = mis_mat, y = as.numeric(y_tilde[,2]))
-    } else {
-        tau_mis <- 0
-    }
-
-    if (syn_ncol > 0) {
-        fast_lmm_syn <- fast_lmm(G = syn_mat, Y = as.numeric(y_tilde[,2]))
-        post_beta_syn <- fast_lmm_syn[[1]]
-        tr_GtG_syn <- fast_lmm_syn[[2]]
-        delta_syn <- fast_lmm_syn[[3]]
-        GtG_syn <- fast_lmm_syn[[4]]
-        tau_syn <- as.numeric(sigma_sq / delta_syn)
-        tau_syn_mom_marginal <- mom_estimator_marginal(G = syn_mat, y = as.numeric(y_tilde[,2]))
-    } else {
-        tau_syn <- 0
-    }
+    tau_lof <- if (!is.null(est_lof)) est_lof$tau else 0
+    tau_mis <- if (!is.null(est_mis)) est_mis$tau else 0
+    tau_syn <- if (!is.null(est_syn)) est_syn$tau else 0
 
     # Estimate variance component tau jointly (MoM estimator), only if all groups are non-empty
     if ((lof_ncol > 0) & (mis_ncol > 0) & (syn_ncol > 0)) {
@@ -570,13 +579,26 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
             G1 = lof_mat,
             G2 = mis_mat,
             G3 = syn_mat,
-            y = as.numeric(y_tilde[,2])
+            y = y_vec
         )
 
         # Adjust variance component tau
-        tau_lof_adj <- tau_lof * tau_mom_joint[1] / tau_lof_mom_marginal[1]
-        tau_mis_adj <- tau_mis * tau_mom_joint[2] / tau_mis_mom_marginal[1]
-        tau_syn_adj <- tau_syn * tau_mom_joint[3] / tau_syn_mom_marginal[1]
+        # Only apply ratio correction when both marginal and joint MoM estimates are positive
+        if (est_lof$tau_mom[1] > 0 && tau_mom_joint[1] > 0) {
+            tau_lof_adj <- tau_lof * tau_mom_joint[1] / est_lof$tau_mom[1]
+        } else {
+            tau_lof_adj <- tau_lof
+        }
+        if (est_mis$tau_mom[1] > 0 && tau_mom_joint[2] > 0) {
+            tau_mis_adj <- tau_mis * tau_mom_joint[2] / est_mis$tau_mom[1]
+        } else {
+            tau_mis_adj <- tau_mis
+        }
+        if (est_syn$tau_mom[1] > 0 && tau_mom_joint[3] > 0) {
+            tau_syn_adj <- tau_syn * tau_mom_joint[3] / est_syn$tau_mom[1]
+        } else {
+            tau_syn_adj <- tau_syn
+        }
     } else {
         # Use marginal variance component tau if any group is empty
         tau_lof_adj <- tau_lof
@@ -585,69 +607,30 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
     }
 
     # Estimate gene-level heritability
-    if (traitType == "binary") {
-        # For binary
-        if (lof_ncol > 0) {
-            h2_lof_adj <- max(tau_lof_adj * tr_GtG_lof / (tau_lof_adj * tr_GtG_lof + sigma_sq * sum(1/v)), 0)
-        } else {
-            h2_lof_adj <- 0
-        }
-
-        if (mis_ncol > 0) {
-            h2_mis_adj <- max(tau_mis_adj * tr_GtG_mis / (tau_mis_adj * tr_GtG_mis + sigma_sq * sum(1/v)), 0)
-        } else {
-            h2_mis_adj <- 0
-        }
-
-        if (syn_ncol > 0) {
-            h2_syn_adj <- max(tau_syn_adj * tr_GtG_syn / (tau_syn_adj * tr_GtG_syn + sigma_sq * sum(1/v)), 0)
-        } else {
-            h2_syn_adj <- 0
-        }
-    } else {
-        # For quantitative
-        if (lof_ncol > 0) {
-            h2_lof_adj <- max(tau_lof_adj * tr_GtG_lof / (tau_lof_adj * tr_GtG_lof + sigma_sq * n_samples), 0)
-        } else {
-            h2_lof_adj <- 0
-        }
-
-        if (mis_ncol > 0) {
-            h2_mis_adj <- max(tau_mis_adj * tr_GtG_mis / (tau_mis_adj * tr_GtG_mis + sigma_sq * n_samples), 0)
-        } else {
-            h2_mis_adj <- 0
-        }
-
-        if (syn_ncol > 0) {
-            h2_syn_adj <- max(tau_syn_adj * tr_GtG_syn / (tau_syn_adj * tr_GtG_syn + sigma_sq * n_samples), 0)
-        } else {
-            h2_syn_adj <- 0
-        }
-    }
+    h2_denom <- if (traitType == "binary") sum(1/v_ordered) else n_samples
+    h2_lof_adj <- if (!is.null(est_lof)) compute_h2(tau_lof_adj, est_lof$tr_GtG, sigma_sq, h2_denom) else 0
+    h2_mis_adj <- if (!is.null(est_mis)) compute_h2(tau_mis_adj, est_mis$tr_GtG, sigma_sq, h2_denom) else 0
+    h2_syn_adj <- if (!is.null(est_syn)) compute_h2(tau_syn_adj, est_syn$tr_GtG, sigma_sq, h2_denom) else 0
 
     # Obtain effect size jointly if all groups are non-empty
     if ((tau_lof_adj > 0) & (tau_mis_adj > 0) & (tau_syn_adj > 0)) {
         post_beta <- calculate_joint_blup(
-            G1 = lof_mat,
-            G2 = mis_mat,
-            G3 = syn_mat,
-            tau1 = tau_lof_adj,
-            tau2 = tau_mis_adj,
-            tau3 = tau_syn_adj,
-            Sigma1 = diag(1, ncol(lof_mat)),
-            Sigma2 = diag(1, ncol(mis_mat)),
-            Sigma3 = diag(1, ncol(syn_mat)),
-            psi = as.numeric(sigma_sq),
-            y = as.numeric(y_tilde[,2])
+            G1 = lof_mat, G2 = mis_mat, G3 = syn_mat,
+            tau1 = tau_lof_adj, tau2 = tau_mis_adj, tau3 = tau_syn_adj,
+            psi = as.numeric(sigma_sq), y = y_vec
         )
     } else {
         # If not, calculate beta marginally
-        post_beta <- as.vector(rbind(post_beta_lof, post_beta_mis, post_beta_syn))
+        post_beta <- as.vector(rbind(
+            if (!is.null(est_lof)) est_lof$post_beta else NULL,
+            if (!is.null(est_mis)) est_mis$post_beta else NULL,
+            if (!is.null(est_syn)) est_syn$post_beta else NULL
+        ))
     }
 
     post_beta <- as.vector(post_beta)
 
-    if (apply_AR == TRUE) {
+    if (isTRUE(apply_AR)) {
         tau1 = tau_lof_adj
         tau2 = tau_mis_adj
         tau3 = tau_syn_adj
@@ -656,69 +639,57 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         Sigma3 = rep(1, ncol(syn_mat))
         psi = as.numeric(sigma_sq)
         lambda <- psi / c(tau1 * Sigma1, tau2 * Sigma2, tau3 * Sigma3)
-        result_AR <- adaptive_ridge(G_reordered, as.numeric(y_tilde[,2]), lambda, q = 0, delta = 1e-5, gamma = 2, max_iter = 5, tol = 0.01, sigma_sq = sigma_sq, n_lof = lof_ncol, n_mis = mis_ncol, n_syn = syn_ncol)
+        result_AR <- adaptive_ridge(G_reordered, y_vec, lambda, q = 0, delta = 1e-5, gamma = 2, max_iter = 5, tol = 0.01, sigma_sq = sigma_sq)
         post_beta <- as.vector(result_AR$beta)
-        se_beta <- (as.vector(result_AR$se_beta))
-    }
-
-    if (apply_AR == FALSE) {
-        # Obtain prediction error variance (PEV)
-        if (lof_ncol > 0) {
-            # diag(GtG_lof) <- diag(GtG_lof) + as.numeric(sigma_sq) / tau_lof_adj
-            GtG_lof <- GtG_lof / as.numeric(sigma_sq)
-            diag(GtG_lof) <- diag(GtG_lof) + 1 / tau_lof_adj
-            PEV_lof <- diag(solve(GtG_lof))
-        } else {
-            PEV_lof <- NULL
-        }
-
-        if (mis_ncol > 0) {
-            # diag(GtG_mis) <- diag(GtG_mis) + as.numeric(sigma_sq) / tau_mis_adj
-            GtG_mis <- GtG_mis / as.numeric(sigma_sq)
-            diag(GtG_mis) <- diag(GtG_mis) + 1 / tau_mis_adj
-            PEV_mis <- diag(solve(GtG_mis))
-        } else {
-            PEV_mis <- NULL
-        }
-
-        if (syn_ncol > 0) {
-            # diag(GtG_syn) <- diag(GtG_syn) + as.numeric(sigma_sq) / tau_syn_adj
-            GtG_syn <- GtG_syn / as.numeric(sigma_sq)
-            diag(GtG_syn) <- diag(GtG_syn) + 1 / tau_syn_adj
-            PEV_syn <- diag(solve(GtG_syn))
-        } else {
-            PEV_syn <- NULL
-        }
-
-        PEV <- abs(c(PEV_lof, PEV_mis, PEV_syn))
-    } else {
+        se_beta <- as.vector(result_AR$se_beta)
         PEV <- se_beta^2
+    } else {
+        # Obtain prediction error variance (PEV)
+        PEV_lof <- if (!is.null(est_lof)) compute_pev(est_lof$GtG, sigma_sq, tau_lof_adj) else NULL
+        PEV_mis <- if (!is.null(est_mis)) compute_pev(est_mis$GtG, sigma_sq, tau_mis_adj) else NULL
+        PEV_syn <- if (!is.null(est_syn)) compute_pev(est_syn$GtG, sigma_sq, tau_syn_adj) else NULL
+        PEV <- abs(c(PEV_lof, PEV_mis, PEV_syn))
     }
 
     # Apply Firth bias correction for binary phenotype
     if (traitType == "binary") {
-        y_binary <- cbind(modglmm$sampleID, modglmm$y)
-        offset1 <- modglmm$linear.predictors - modglmm$coefficients[1]
-        l2.var = 1
-        maxit = 50
+        # Align y and offset to G_reordered sample order
+        firth_model_idx <- match(rownames(G_reordered), modglmm$sampleID)
+        y_binary_vec <- modglmm$y[firth_model_idx]
+        offset1 <- modglmm$linear.predictors[firth_model_idx] - modglmm$coefficients[1]
+
+        out_single_wL2_lof_sparse <- numeric(0)
+        out_single_wL2_mis_sparse <- numeric(0)
+        out_single_wL2_syn_sparse <- numeric(0)
 
         # LoF
-        G.lof.sp <- as(G_reordered[,c(1:lof_ncol), drop = F], "sparseMatrix")
-        nMarker.lof <- ncol(G.lof.sp)
-        out_single_wL2_lof_sparse <- Run_Firth_MultiVar_Single(G.lof.sp, modglmm$obj.noK, as.numeric(y_binary[,2]), offset1, nMarker.lof, l2.var=1/(2*tau_lof_adj), Is.Fast=FALSE, Is.Sparse=TRUE)[,2]
-        # print(out_single_wL2_lof_sparse)
+        if (lof_ncol > 0) {
+            G.lof.sp <- as(G_reordered[, 1:lof_ncol, drop = F], "sparseMatrix")
+            out_single_wL2_lof_sparse <- Run_Firth_MultiVar_Single(
+                G.lof.sp, modglmm$obj.noK, y_binary_vec, offset1,
+                lof_ncol, l2.var = 1/(2*tau_lof_adj),
+                Is.Fast = FALSE, Is.Sparse = TRUE)[, 2]
+        }
 
         # mis
-        G.mis.sp <- as(G_reordered[,c((lof_ncol + 1):(lof_ncol + mis_ncol)), drop = F], "sparseMatrix")
-        nMarker.mis <- ncol(G.mis.sp)
-        out_single_wL2_mis_sparse <- Run_Firth_MultiVar_Single(G.mis.sp, modglmm$obj.noK, as.numeric(y_binary[,2]), offset1, nMarker.mis, l2.var=1/(2*tau_mis_adj), Is.Fast=FALSE, Is.Sparse=TRUE)[,2]
-        # print(out_single_wL2_mis_sparse)
+        if (mis_ncol > 0) {
+            mis_cols <- (lof_ncol + 1):(lof_ncol + mis_ncol)
+            G.mis.sp <- as(G_reordered[, mis_cols, drop = F], "sparseMatrix")
+            out_single_wL2_mis_sparse <- Run_Firth_MultiVar_Single(
+                G.mis.sp, modglmm$obj.noK, y_binary_vec, offset1,
+                mis_ncol, l2.var = 1/(2*tau_mis_adj),
+                Is.Fast = FALSE, Is.Sparse = TRUE)[, 2]
+        }
 
         # syn
-        G.syn.sp <- as(G_reordered[,c((lof_ncol + mis_ncol + 1):(lof_ncol + mis_ncol + syn_ncol)), drop = F], "sparseMatrix")
-        nMarker.syn <- ncol(G.syn.sp)
-        out_single_wL2_syn_sparse <- Run_Firth_MultiVar_Single(G.syn.sp, modglmm$obj.noK, as.numeric(y_binary[,2]), offset1, nMarker.syn, l2.var=1/(2*tau_syn_adj), Is.Fast=FALSE, Is.Sparse=TRUE)[,2]
-        # print(out_single_wL2_syn_sparse)
+        if (syn_ncol > 0) {
+            syn_cols <- (lof_ncol + mis_ncol + 1):(lof_ncol + mis_ncol + syn_ncol)
+            G.syn.sp <- as(G_reordered[, syn_cols, drop = F], "sparseMatrix")
+            out_single_wL2_syn_sparse <- Run_Firth_MultiVar_Single(
+                G.syn.sp, modglmm$obj.noK, y_binary_vec, offset1,
+                syn_ncol, l2.var = 1/(2*tau_syn_adj),
+                Is.Fast = FALSE, Is.Sparse = TRUE)[, 2]
+        }
 
         beta_firth <- c(out_single_wL2_lof_sparse, out_single_wL2_mis_sparse, out_single_wL2_syn_sparse)
         effect <- ifelse(abs(post_beta) < log(2), post_beta, beta_firth)
@@ -730,38 +701,87 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
     # output related to single-variant effect size
     variant <- colnames(G)
 
+    # Build annotation and is_UR vectors
+    anno_vec <- c(rep("lof", lof_ncol), rep("missense", mis_ncol), rep("synonymous", syn_ncol))
+    is_UR <- grepl("_UR$", variant)
+
+    # Parse variant IDs (chr:pos:ref:alt), UR rows get NA
+    parsed <- do.call(rbind, lapply(variant, function(v) {
+        parts <- strsplit(v, ":")[[1]]
+        if (length(parts) >= 4) {
+            data.frame(pos = as.integer(parts[2]), ref = parts[3], alt = parts[4],
+                       stringsAsFactors = FALSE)
+        } else {
+            data.frame(pos = NA_integer_, ref = NA_character_, alt = NA_character_,
+                       stringsAsFactors = FALSE)
+        }
+    }))
+
+    # MAC / MAF per variant
+    MAC_vec <- as.numeric(colSums(G_reordered))
+    MAF_vec <- MAC_vec / (2 * n_samples)
+    # UR rows: set MAC/MAF to NA (collapsed indicator, not a single variant)
+    MAC_vec[is_UR] <- NA
+    MAF_vec[is_UR] <- NA
+
+    SE <- sqrt(PEV)
+
+    # Determine sign of gene-level effect
     if (lof_ncol == 1) {
         sgn <- sign(post_beta[1])
     } else if (lof_ncol == 0) {
-        print("LoF variant does not exist, so the sign of the effect size is calculated by the sign of other groups.")
-        MAC <- colSums(G_reordered)
-        sgn <- sign(sum(MAC * post_beta))
+        message("LoF variant does not exist, so the sign of the effect size is calculated by the sign of other groups.")
+        MAC_sign <- colSums(G_reordered)
+        sgn <- sign(sum(MAC_sign * post_beta))
     } else {
-        MAC <- colSums(G_reordered[,c(1:(lof_ncol)), drop = F])
-        sgn <- sign(sum(MAC * post_beta[c(1:(lof_ncol))]))
+        MAC_sign <- colSums(G_reordered[,c(1:(lof_ncol)), drop = F])
+        sgn <- sign(sum(MAC_sign * post_beta[c(1:(lof_ncol))]))
     }
 
+    # is_flipped per variant
+    flipped_var_all <- rbind(lof_flipped, mis_flipped, syn_flipped)
+    is_flipped_vec <- variant %in% flipped_var_all[is_flipped == TRUE, ]$var_list
+
+    # Build effect output data.frame
+    effect_out <- data.frame(
+        gene = geneName,
+        chr = chrom,
+        pos = parsed$pos,
+        ref = parsed$ref,
+        alt = parsed$alt,
+        variant = variant,
+        annotation = anno_vec,
+        is_UR = is_UR,
+        MAC = MAC_vec,
+        MAF = MAF_vec,
+        effect = as.numeric(effect),
+        SE = SE,
+        PEV = PEV,
+        is_flipped = is_flipped_vec,
+        stringsAsFactors = FALSE
+    )
+
+    # Flip sign for allele-flipped variants
+    effect_out[is_flipped_vec, "effect"] <- -effect_out[is_flipped_vec, "effect"]
+
+    # Build h2 output data.frame (vertical format)
     h2_all <- sum(h2_lof_adj, h2_mis_adj, h2_syn_adj) * sgn
-    h2 <- c(h2_lof_adj, h2_mis_adj, h2_syn_adj, h2_all)
-    group <- c("LoF", "mis", "syn", "all")
-
-    effect_out <- as.data.frame(cbind(variant, effect, PEV))
-    effect_out$effect <- as.numeric(effect_out$effect)
-    effect_out$PEV <- as.numeric(effect_out$PEV)
-    h2_out <- rbind(group, h2)
-
-    # Find flipped var and change the sign of the effect size
-    flipped_var <- rbind(lof_flipped, mis_flipped, syn_flipped)
-    flipped_var <- flipped_var[is_flipped == TRUE,]$var_list
-    effect_out[which(effect_out$variant %in% flipped_var),]$effect <- -effect_out[which(effect_out$variant %in% flipped_var),]$effect
+    h2_out <- data.frame(
+        gene = geneName,
+        chr = chrom,
+        group = c("LoF", "mis", "syn", "all"),
+        h2 = c(h2_lof_adj, h2_mis_adj, h2_syn_adj, abs(h2_all)),
+        h2_signed = c(h2_lof_adj * sgn, h2_mis_adj * sgn, h2_syn_adj * sgn, h2_all),
+        tau_adj = c(tau_lof_adj, tau_mis_adj, tau_syn_adj, NA),
+        n_variants = c(lof_ncol, mis_ncol, syn_ncol, lof_ncol + mis_ncol + syn_ncol),
+        stringsAsFactors = FALSE
+    )
 
     effect_outname <- paste0(outputPrefix, "_effect.txt")
     h2_outname <- paste0(outputPrefix, "_h2.txt")
 
-    # print(effect_out)
-    # print(h2_out)
-    write.table(effect_out, effect_outname, row.names=F, quote=F)
-    write.table(h2_out, h2_outname, row.names=F, col.names=F, quote=F)
+    write.table(effect_out, effect_outname, row.names = FALSE, quote = FALSE, sep = "\t")
+    write.table(h2_out, h2_outname, row.names = FALSE, quote = FALSE, sep = "\t")
 
-    print("Analysis completed.")
+    message("Analysis completed.")
 }
