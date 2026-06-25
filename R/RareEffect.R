@@ -72,16 +72,22 @@ read_matrix_by_one_marker <- function(objGeno, var_list, sampleID) {
             t_isImputation = FALSE
         )
 
-        # Single scan: positive entries are the non-missing, non-zero genotypes
-        # (missing is encoded as -1 by C++ side and is skipped naturally)
+        # Unified_getOneMarker returns missing genotypes as a large sentinel (~2^64), NOT -1.
+        # Treat anything outside the valid [0,2] dosage range as missing and impute to 0 BEFORE
+        # the allele-sum / flip decision; otherwise the sentinel overflows sum() and spuriously
+        # triggers a flip, which then counts the major allele and corrupts MAC.
+        miss <- which(t_GVec < 0 | t_GVec > 2)
+        if (length(miss) > 0) t_GVec[miss] <- 0
+
+        # positive entries are now the non-missing, non-zero genotypes
         nz <- which(t_GVec > 0)
         vals <- t_GVec[nz]
         s <- sum(vals)
         if (s > n_samples) {
-            # Major allele is ALT — flip. Almost never hit for rare variants.
-            # Note: this densifies the column (most zeros become 2s).
-            t_GVec[t_GVec < 0] <- 0
+            # Major allele is ALT — flip to count the minor allele. Almost never hit for rare
+            # variants. Note: this densifies the column (most zeros become 2s).
             t_GVec <- 2 - t_GVec
+            t_GVec[miss] <- 0     # keep imputed-missing at 0 (not 2) after the flip
             is_flipped[i] <- TRUE
             nz <- which(t_GVec > 0)
             vals <- t_GVec[nz]
@@ -125,11 +131,18 @@ collapse_matrix <- function(objGeno, var_list, sampleID, modglmm, macThreshold =
         return(list(empty_mat, flipped_var))
     }
     mat_rare <- mat[, idx_rare, drop = FALSE]
-    mat_UR <- mat[, idx_UR, drop = FALSE]
-    UR_rowsum <- rowSums(mat_UR)
-    UR_rowsum[which(UR_rowsum > 1)] <- 1
-    mat_UR_collapsed <- cbind(mat_rare, UR_rowsum)
-    return(list(mat_UR_collapsed, flipped_var))
+    if (length(idx_UR) > 0) {
+        mat_UR <- mat[, idx_UR, drop = FALSE]
+        UR_rowsum <- rowSums(mat_UR)
+        UR_rowsum[which(UR_rowsum > 1)] <- 1
+        mat_out <- cbind(mat_rare, UR_rowsum)
+        colnames(mat_out)[ncol(mat_out)] <- "UR"   # sentinel name for the collapsed ultra-rare column
+    } else {
+        # No ultra-rare variants: do NOT append a degenerate all-zero UR column (it would
+        # otherwise surface as a meaningless *_UR row indistinguishable from a true 0 effect).
+        mat_out <- mat_rare
+    }
+    return(list(mat_out, flipped_var))
 }
 
 get_range <- function(v) {
@@ -165,10 +178,7 @@ calc_log_lik <- function(delta, S, UtY, Y_UUtY) {
     k <- length(S)
     n <- nrow(Y_UUtY)
 
-    log_lik1 <- 0
-    for (i in 1:k) {
-        log_lik1 <- log_lik1 + (UtY[i, ])^2 / (S[i] + delta)
-    }
+    log_lik1 <- sum(as.numeric(UtY)^2 / (S + delta))   # vectorized over the k singular directions
 
     log_lik2 <- 1 / delta * sum((Y_UUtY)^2)
 
@@ -180,12 +190,8 @@ calc_log_lik <- function(delta, S, UtY, Y_UUtY) {
 
 calc_post_beta <- function(G, delta, S, UtY, U, Sigma = NULL) {
     d_vec <- as.numeric(1 / (S + delta))
-    if (length(d_vec) == 1) {
-        D <- matrix(d_vec, 1, 1)
-    } else {
-        D <- diag(d_vec)
-    }
-    UDUtY <- U %*% D %*% UtY
+    # U %*% diag(d_vec) %*% UtY == U %*% (d_vec * UtY); avoid forming the k x k diagonal and an extra matmul
+    UDUtY <- U %*% (d_vec * UtY)
     if (is.null(Sigma)) {
         out <- t(G) %*% UDUtY
     } else {
@@ -204,12 +210,13 @@ fast_lmm <- function(G, Y, Sigma = NULL) {
     }
     Y <- as.matrix(Y)
 
-    # W = G %*% chol(Sigma), or just G when Sigma = I
+    # We need W with W W' = G Sigma G'. R's chol(Sigma) returns upper-tri R with R'R = Sigma,
+    # so (G R')(G R')' = G R' R G' = G Sigma G'  =>  W = G %*% t(chol(Sigma)).
     if (is.null(Sigma)) {
         W_sparse <- as(G, "dgCMatrix")
     } else {
         L <- chol(Sigma)
-        W_sparse <- as(G %*% L, "dgCMatrix")
+        W_sparse <- as(G %*% t(L), "dgCMatrix")
     }
 
     svd_mat <- sparsesvd::sparsesvd(W_sparse)
@@ -222,7 +229,8 @@ fast_lmm <- function(G, Y, Sigma = NULL) {
                  method = "Brent", lower = 1e-10, upper = 1e6,
                  control = list(fnscale = -1))
 
-    tr_GtG_Sigma <- if (is.null(Sigma)) sum(diag(GtG)) else sum(diag(GtG %*% Sigma))
+    # tr(G Sigma G') = tr(G'G Sigma) = sum(GtG * Sigma) for symmetric GtG, Sigma (avoids the full matmul)
+    tr_GtG_Sigma <- if (is.null(Sigma)) sum(diag(GtG)) else sum(GtG * Sigma)
     post_beta <- calc_post_beta(G, opt$par, S, UtY, U, Sigma = Sigma)
 
     return(list(post_beta, tr_GtG_Sigma, opt$par, GtG))
@@ -239,15 +247,15 @@ calc_gene_effect_size <- function(G, lof_ncol, post_beta, Y) {
     return(m1$coefficients[2])
 }
 
-mom_estimator_marginal <- function(G, y, Sigma = NULL) {
+mom_estimator_marginal <- function(G, y, Sigma = NULL, GtG = NULL) {
     n <- length(y)
     G <- as(G, "dgCMatrix")
     G[is.na(G)] <- 0
 
     if (is.null(Sigma)) {
-        GtG <- crossprod(G)
+        if (is.null(GtG)) GtG <- crossprod(G)   # reuse the GtG already formed in fast_lmm when available
         t1 <- sum(GtG^2)                    # tr((GG')^2)
-        t2 <- sum(G^2)                      # tr(G'G)
+        t2 <- sum(diag(GtG))                # tr(G'G) == sum(G^2)
         Gty <- crossprod(G, y)
         c1 <- as.numeric(sum(Gty^2))        # y'GG'y
     } else {
@@ -270,10 +278,10 @@ mom_estimator_joint <- function(G1, G2, G3, y,
     G2 <- as(G2, "dgCMatrix"); G2[is.na(G2)] <- 0
     G3 <- as(G3, "dgCMatrix"); G3[is.na(G3)] <- 0
 
-    # W_k = G_k %*% chol(Sigma_k), or G_k when Sigma_k = I
-    W1 <- if (is.null(Sigma1)) G1 else G1 %*% chol(Sigma1)
-    W2 <- if (is.null(Sigma2)) G2 else G2 %*% chol(Sigma2)
-    W3 <- if (is.null(Sigma3)) G3 else G3 %*% chol(Sigma3)
+    # W_k with W_k W_k' = G_k Sigma_k G_k'  =>  W_k = G_k %*% t(chol(Sigma_k)) (R chol gives R'R = Sigma)
+    W1 <- if (is.null(Sigma1)) G1 else G1 %*% t(chol(Sigma1))
+    W2 <- if (is.null(Sigma2)) G2 else G2 %*% t(chol(Sigma2))
+    W3 <- if (is.null(Sigma3)) G3 else G3 %*% t(chol(Sigma3))
 
     t11 <- sum(crossprod(W1)^2)
     t22 <- sum(crossprod(W2)^2)
@@ -319,8 +327,12 @@ calculate_joint_blup <- function(G1, G2, G3, tau1, tau2, tau3, psi, y) {
     inv_tau_diag <- c(rep(1/tau1, p1), rep(1/tau2, p2), rep(1/tau3, p3))
     diag(C) <- diag(C) + inv_tau_diag
 
-    beta <- solve(C, Gty / psi)
-    return(beta)
+    C_inv <- solve(C)
+    beta <- C_inv %*% (Gty / psi)
+    # Joint posterior (prediction error) variance: diag of the full joint precision inverse,
+    # which (unlike the per-group PEV) accounts for cross-group correlation among variants.
+    pev <- diag(C_inv)
+    return(list(beta = as.vector(beta), pev = as.numeric(pev)))
 }
 
 weight_cal <- function(beta_k, delta = 10^(-5), gamma = 2, q = 0, factor2 = 1) {
@@ -356,13 +368,14 @@ adaptive_ridge <- function(X, y, lambda, q = 0, delta = 1e-5, gamma = 2, max_ite
     Xy <- crossprod(X, y)
     XX <- crossprod(X)
     for (k in 1:max_iter) {
-        A <- XX + 0                                 # copy to preserve XX
-        diag(A) <- diag(A) + lambda * w
+        A <- XX
+        diag(A) <- diag(A) + lambda * w             # copy-on-write keeps XX intact
         beta_new <- solve(A, Xy)
 
         w_new <- weight_cal(beta_new, delta = delta, gamma = gamma, q = q)$w_out
 
-        if (sqrt(sum((beta_new - beta)^2)) < sum(beta^2) * tol) {
+        # relative convergence: ||beta_new - beta|| < tol * ||beta||  (both are norms)
+        if (sqrt(sum((beta_new - beta)^2)) < sqrt(sum(beta^2)) * tol) {
             break
         }
 
@@ -370,7 +383,7 @@ adaptive_ridge <- function(X, y, lambda, q = 0, delta = 1e-5, gamma = 2, max_ite
         w <- w_new
     }
 
-    A <- XX + 0
+    A <- XX
     diag(A) <- diag(A) + lambda * w
     A_inv <- chol2inv(chol(A))
 
@@ -388,7 +401,7 @@ estimate_group <- function(mat, y_vec, sigma_sq) {
     delta     <- result[[3]]
     GtG       <- result[[4]]
     tau       <- as.numeric(sigma_sq / delta)
-    tau_mom   <- mom_estimator_marginal(G = mat, y = y_vec)
+    tau_mom   <- mom_estimator_marginal(G = mat, y = y_vec, GtG = GtG)
     list(post_beta = post_beta, tr_GtG = tr_GtG, delta = delta,
          GtG = GtG, tau = tau, tau_mom = tau_mom)
 }
@@ -468,7 +481,7 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         lof_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[1]], sampleID, modglmm, macThreshold = 0)
         lof_mat_collapsed <- lof_mat_collapsed_all[[1]]
         lof_flipped <- lof_mat_collapsed_all[[2]]
-        lof_mat_collapsed <- Matrix::Matrix(rowSums(lof_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(lof_mat_collapsed), NULL))
+        lof_mat_collapsed <- Matrix::Matrix(rowSums(lof_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(lof_mat_collapsed), "lof_UR"))
     } else {
         lof_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[1]], sampleID, modglmm, macThreshold)
         lof_mat_collapsed <- lof_mat_collapsed_all[[1]]
@@ -478,7 +491,7 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         mis_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[2]], sampleID, modglmm, macThreshold = 0)
         mis_mat_collapsed <- mis_mat_collapsed_all[[1]]
         mis_flipped <- mis_mat_collapsed_all[[2]]
-        mis_mat_collapsed <- Matrix::Matrix(rowSums(mis_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(mis_mat_collapsed), NULL))
+        mis_mat_collapsed <- Matrix::Matrix(rowSums(mis_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(mis_mat_collapsed), "mis_UR"))
     } else {
         mis_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[2]], sampleID, modglmm, macThreshold)
         mis_mat_collapsed <- mis_mat_collapsed_all[[1]]
@@ -489,23 +502,23 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         syn_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[3]], sampleID, modglmm, macThreshold = 0)
         syn_mat_collapsed <- syn_mat_collapsed_all[[1]]
         syn_flipped <- syn_mat_collapsed_all[[2]]
-        syn_mat_collapsed <- Matrix::Matrix(rowSums(syn_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(syn_mat_collapsed), NULL))
+        syn_mat_collapsed <- Matrix::Matrix(rowSums(syn_mat_collapsed), ncol = 1, sparse = TRUE, dimnames = list(rownames(syn_mat_collapsed), "syn_UR"))
     } else {
         syn_mat_collapsed_all <- collapse_matrix(objGeno, var_by_func_anno[[3]], sampleID, modglmm, macThreshold)
         syn_mat_collapsed <- syn_mat_collapsed_all[[1]]
         syn_flipped <- syn_mat_collapsed_all[[2]]
     }
 
-    # Set column name
-    if (ncol(lof_mat_collapsed) > 0) {
-        colnames(lof_mat_collapsed)[ncol(lof_mat_collapsed)] <- "lof_UR"
-    }
-    if (ncol(mis_mat_collapsed) > 0) {
-        colnames(mis_mat_collapsed)[ncol(mis_mat_collapsed)] <- "mis_UR"
-    }
-    if (ncol(syn_mat_collapsed) > 0) {
-        colnames(syn_mat_collapsed)[ncol(syn_mat_collapsed)] <- "syn_UR"
-    }
+    # Rename the collapsed ultra-rare sentinel column ("UR") to the group-specific label.
+    # collapse_matrix only emits this column when the group actually has ultra-rare variants, so
+    # groups without any ultra-rare variant produce NO *_UR row (avoids an ambiguous 0-effect row).
+    # (The collapse* = TRUE branches already named their single whole-group burden column directly.)
+    ur_idx <- which(colnames(lof_mat_collapsed) == "UR")
+    if (length(ur_idx) > 0) colnames(lof_mat_collapsed)[ur_idx] <- "lof_UR"
+    ur_idx <- which(colnames(mis_mat_collapsed) == "UR")
+    if (length(ur_idx) > 0) colnames(mis_mat_collapsed)[ur_idx] <- "mis_UR"
+    ur_idx <- which(colnames(syn_mat_collapsed) == "UR")
+    if (length(ur_idx) > 0) colnames(syn_mat_collapsed)[ur_idx] <- "syn_UR"
 
     # Make genotype matrix
     nonempty_mat <- list()
@@ -606,19 +619,32 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         tau_syn_adj <- tau_syn
     }
 
-    # Estimate gene-level heritability
+    # Estimate gene-level heritability.
+    # Heritability is defined on the working-residual (tilde-y) scale (paper eqs. for h2_j):
+    #   h2 = tr(G Sigma G') / (tr(G Sigma G') + psi * sum(1/v_i))   [binary]
+    # The numerator tr(G Sigma G') uses the ORIGINAL genotype G. For binary traits the group
+    # matrices fed to fast_lmm are the standardized sqrt(v)*G, whose tr is v-weighted (z-scale),
+    # which would mix scales with the tilde-y-scale denominator psi*sum(1/v). So recompute the
+    # unweighted trace from G_reordered. (For quantitative this equals est$tr_GtG, i.e. no change.)
     h2_denom <- if (traitType == "binary") sum(1/v_ordered) else n_samples
-    h2_lof_adj <- if (!is.null(est_lof)) compute_h2(tau_lof_adj, est_lof$tr_GtG, sigma_sq, h2_denom) else 0
-    h2_mis_adj <- if (!is.null(est_mis)) compute_h2(tau_mis_adj, est_mis$tr_GtG, sigma_sq, h2_denom) else 0
-    h2_syn_adj <- if (!is.null(est_syn)) compute_h2(tau_syn_adj, est_syn$tr_GtG, sigma_sq, h2_denom) else 0
+    tr_lof_h2 <- if (lof_ncol > 0) sum(G_reordered[, 1:lof_ncol, drop = FALSE]^2) else 0
+    tr_mis_h2 <- if (mis_ncol > 0) sum(G_reordered[, (lof_ncol + 1):(lof_ncol + mis_ncol), drop = FALSE]^2) else 0
+    tr_syn_h2 <- if (syn_ncol > 0) sum(G_reordered[, (lof_ncol + mis_ncol + 1):(lof_ncol + mis_ncol + syn_ncol), drop = FALSE]^2) else 0
+    h2_lof_adj <- if (!is.null(est_lof)) compute_h2(tau_lof_adj, tr_lof_h2, sigma_sq, h2_denom) else 0
+    h2_mis_adj <- if (!is.null(est_mis)) compute_h2(tau_mis_adj, tr_mis_h2, sigma_sq, h2_denom) else 0
+    h2_syn_adj <- if (!is.null(est_syn)) compute_h2(tau_syn_adj, tr_syn_h2, sigma_sq, h2_denom) else 0
 
     # Obtain effect size jointly if all groups are non-empty
-    if ((tau_lof_adj > 0) & (tau_mis_adj > 0) & (tau_syn_adj > 0)) {
-        post_beta <- calculate_joint_blup(
+    used_joint <- (tau_lof_adj > 0) & (tau_mis_adj > 0) & (tau_syn_adj > 0)
+    joint_pev <- NULL
+    if (used_joint) {
+        blup <- calculate_joint_blup(
             G1 = lof_mat, G2 = mis_mat, G3 = syn_mat,
             tau1 = tau_lof_adj, tau2 = tau_mis_adj, tau3 = tau_syn_adj,
             psi = as.numeric(sigma_sq), y = y_vec
         )
+        post_beta <- blup$beta
+        joint_pev <- blup$pev
     } else {
         # If not, calculate beta marginally
         post_beta <- as.vector(rbind(
@@ -634,17 +660,26 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
         tau1 = tau_lof_adj
         tau2 = tau_mis_adj
         tau3 = tau_syn_adj
-        Sigma1 = rep(1, ncol(lof_mat))
-        Sigma2 = rep(1, ncol(mis_mat))
-        Sigma3 = rep(1, ncol(syn_mat))
+        # Use *_ncol (0 for empty groups) instead of ncol(*_mat); an empty group's mat is NULL,
+        # and ncol(NULL) is NULL, which would break rep()/c() below.
+        Sigma1 = rep(1, lof_ncol)
+        Sigma2 = rep(1, mis_ncol)
+        Sigma3 = rep(1, syn_ncol)
         psi = as.numeric(sigma_sq)
         lambda <- psi / c(tau1 * Sigma1, tau2 * Sigma2, tau3 * Sigma3)
-        result_AR <- adaptive_ridge(G_reordered, y_vec, lambda, q = 0, delta = 1e-5, gamma = 2, max_iter = 5, tol = 0.01, sigma_sq = sigma_sq)
+        # Use the same working design as the variance-component / BLUP step:
+        # standardized sqrt(v) * G for binary, raw G for quantitative.
+        design_AR <- if (traitType == "binary") vG_reordered else G_reordered
+        result_AR <- adaptive_ridge(design_AR, y_vec, lambda, q = 0, delta = 1e-5, gamma = 2, max_iter = 5, tol = 0.01, sigma_sq = sigma_sq)
         post_beta <- as.vector(result_AR$beta)
         se_beta <- as.vector(result_AR$se_beta)
         PEV <- se_beta^2
+    } else if (used_joint) {
+        # post_beta came from the joint BLUP -> use the matching joint PEV (accounts for
+        # cross-group covariance, unlike the per-group block-diagonal compute_pev()).
+        PEV <- abs(joint_pev)
     } else {
-        # Obtain prediction error variance (PEV)
+        # Marginal (per-group, block-diagonal) prediction error variance (PEV)
         PEV_lof <- if (!is.null(est_lof)) compute_pev(est_lof$GtG, sigma_sq, tau_lof_adj) else NULL
         PEV_mis <- if (!is.null(est_mis)) compute_pev(est_mis$GtG, sigma_sq, tau_mis_adj) else NULL
         PEV_syn <- if (!is.null(est_syn)) compute_pev(est_syn$GtG, sigma_sq, tau_syn_adj) else NULL
@@ -705,71 +740,76 @@ run_RareEffect <- function(rdaFile, chrom, geneName, groupFile, traitType, bedFi
     anno_vec <- c(rep("lof", lof_ncol), rep("missense", mis_ncol), rep("synonymous", syn_ncol))
     is_UR <- grepl("_UR$", variant)
 
-    # Parse variant IDs (chr:pos:ref:alt), UR rows get NA
-    parsed <- do.call(rbind, lapply(variant, function(v) {
-        parts <- strsplit(v, ":")[[1]]
-        if (length(parts) >= 4) {
-            data.frame(pos = as.integer(parts[2]), ref = parts[3], alt = parts[4],
-                       stringsAsFactors = FALSE)
-        } else {
-            data.frame(pos = NA_integer_, ref = NA_character_, alt = NA_character_,
-                       stringsAsFactors = FALSE)
-        }
-    }))
+    # Look up POS and alleles from the PLINK bim (authoritative), rather than parsing them out
+    # of the variant ID (IDs may be rs IDs that carry no allele info). With AlleleOrder =
+    # "alt-first" the bim's first allele column (5) is ALT = the effect allele = Allele2, and the
+    # second (6) is REF = Allele1; this matches how the genotype dosage / BETA / AF are coded.
+    # *_UR collapse labels (and any ID absent from the bim) do not match and become NA.
+    bim_info <- data.table::fread(bimFile, header = FALSE, select = c(2, 4, 5, 6),
+                                  col.names = c("ID", "POS", "ALT", "REF"))
+    bidx <- match(variant, bim_info$ID)
+    pos_vec <- bim_info$POS[bidx]
+    ref_vec <- bim_info$REF[bidx]   # Allele1 (REF / bim A2)
+    alt_vec <- bim_info$ALT[bidx]   # Allele2 (ALT / bim A1, effect allele)
 
-    # MAC / MAF per variant
-    MAC_vec <- as.numeric(colSums(G_reordered))
-    MAF_vec <- MAC_vec / (2 * n_samples)
-    # UR rows: set MAC/MAF to NA (collapsed indicator, not a single variant)
-    MAC_vec[is_UR] <- NA
-    MAF_vec[is_UR] <- NA
-
-    SE <- sqrt(PEV)
-
-    # Determine sign of gene-level effect
-    if (lof_ncol == 1) {
-        sgn <- sign(post_beta[1])
-    } else if (lof_ncol == 0) {
-        message("LoF variant does not exist, so the sign of the effect size is calculated by the sign of other groups.")
-        MAC_sign <- colSums(G_reordered)
-        sgn <- sign(sum(MAC_sign * post_beta))
-    } else {
-        MAC_sign <- colSums(G_reordered[,c(1:(lof_ncol)), drop = F])
-        sgn <- sign(sum(MAC_sign * post_beta[c(1:(lof_ncol))]))
-    }
-
-    # is_flipped per variant
+    # is_flipped per variant (internally recoded to the minor allele; track which were flipped)
     flipped_var_all <- rbind(lof_flipped, mis_flipped, syn_flipped)
     is_flipped_vec <- variant %in% flipped_var_all[is_flipped == TRUE, ]$var_list
 
-    # Build effect output data.frame
+    # Allele count/frequency on the ALT allele (= Allele2 = effect allele).
+    # colSums(G_reordered) counts the internally-recoded minor allele, so for flipped
+    # variants the ALT count is (2N - minor count).
+    minor_AC <- as.numeric(colSums(G_reordered))
+    AC_Allele2 <- minor_AC
+    AC_Allele2[is_flipped_vec] <- 2 * n_samples - minor_AC[is_flipped_vec]
+    AF_Allele2 <- AC_Allele2 / (2 * n_samples)
+    AC_Allele2[is_UR] <- NA      # UR rows are collapsed indicators, not single variants
+    AF_Allele2[is_UR] <- NA
+
+    SE <- sqrt(PEV)
+
+    # Determine sign of gene-level effect from the reported (Firth-corrected) effect sizes,
+    # weighted by allele count (proportional to MAF): sgn(sum_j beta_j * MAF_j).
+    if (lof_ncol == 1) {
+        sgn <- sign(effect[1])
+    } else if (lof_ncol == 0) {
+        message("LoF variant does not exist, so the sign of the effect size is calculated by the sign of other groups.")
+        MAC_sign <- colSums(G_reordered)
+        sgn <- sign(sum(MAC_sign * effect))
+    } else {
+        MAC_sign <- colSums(G_reordered[,c(1:(lof_ncol)), drop = F])
+        sgn <- sign(sum(MAC_sign * effect[c(1:(lof_ncol))]))
+    }
+
+    # Build effect output data.frame (SAIGE-style single-variant columns)
+    # BETA is reported per ALT (Allele2 / effect) allele; internal estimates are on the minor
+    # allele (the genotype is recoded to minor for accurate estimation), so negate the flipped
+    # ones to express everything on the ref/alt convention used in the summary output.
+    beta_alt <- as.numeric(effect)
+    beta_alt[is_flipped_vec] <- -beta_alt[is_flipped_vec]
+
     effect_out <- data.frame(
         gene = geneName,
-        chr = chrom,
-        pos = parsed$pos,
-        ref = parsed$ref,
-        alt = parsed$alt,
-        variant = variant,
+        CHR = chrom,
+        POS = pos_vec,
+        MarkerID = variant,
+        Allele1 = ref_vec,
+        Allele2 = alt_vec,
         annotation = anno_vec,
         is_UR = is_UR,
-        MAC = MAC_vec,
-        MAF = MAF_vec,
-        effect = as.numeric(effect),
+        AC_Allele2 = AC_Allele2,
+        AF_Allele2 = AF_Allele2,
+        BETA = beta_alt,
         SE = SE,
-        PEV = PEV,
-        is_flipped = is_flipped_vec,
         stringsAsFactors = FALSE
     )
 
-    # Flip sign for allele-flipped variants
-    effect_out[is_flipped_vec, "effect"] <- -effect_out[is_flipped_vec, "effect"]
-
-    # Build h2 output data.frame (vertical format)
+    # Build h2 output data.frame (vertical format); group labels match effect_out$annotation
     h2_all <- sum(h2_lof_adj, h2_mis_adj, h2_syn_adj) * sgn
     h2_out <- data.frame(
         gene = geneName,
-        chr = chrom,
-        group = c("LoF", "mis", "syn", "all"),
+        CHR = chrom,
+        group = c("lof", "missense", "synonymous", "all"),
         h2 = c(h2_lof_adj, h2_mis_adj, h2_syn_adj, abs(h2_all)),
         h2_signed = c(h2_lof_adj * sgn, h2_mis_adj * sgn, h2_syn_adj * sgn, h2_all),
         tau_adj = c(tau_lof_adj, tau_mis_adj, tau_syn_adj, NA),
